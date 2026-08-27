@@ -1,0 +1,6 @@
+scrapling[rag]
+langchain-text-splitters
+sentence-transformers
+psycopg2-binary
+python-dotenv
+numpyemoji
