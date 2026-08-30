@@ -51,10 +51,9 @@ def main():
 
     if not args.skip_scrape:
         with timed("Step 1: Data collection (spider)"):
-            from src.spider import TransformerDocsSpider
-            result = TransformerDocsSpider().start()
-            result.items.to_jsonl("data/raw_docs.jsonl")
-            print(f"Collected {len(result.items)} pages -> data/raw_docs.jsonl")
+            from src.collection import run as collect_run
+            docs = collect_run()
+            print(f"Collected {len(docs)} pages -> data/raw_docs.jsonl")
 
     with timed("Step 2: Cleaning & filtering"):
         from src.clean import run as clean_run

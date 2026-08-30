@@ -1,6 +1,8 @@
-scrapling[rag]
+scrapling[rag,fetchers]
+PyMuPDF
 langchain-text-splitters
 sentence-transformers
 psycopg2-binary
 python-dotenv
-numpyemoji
+numpy
+emoji

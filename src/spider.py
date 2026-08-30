@@ -88,7 +88,10 @@ class TransformerDocsSpider(SiteToMarkdownSpider):
         "https://lilianweng.github.io/posts/2021-01-02-controllable-text-generation/",
     ]
 
-    allowed_domains = {"arxiv.org", "huggingface.co", "lilianweng.github.io"}
+    # Legacy Scrapling entry point. The pipeline now uses src.collection,
+    # whose full-text fallback includes ar5iv; retain this allow-list entry
+    # for callers that still instantiate this spider directly.
+    allowed_domains = {"arxiv.org", "ar5iv.labs.arxiv.org", "huggingface.co", "lilianweng.github.io"}
     output_dir = "data/raw_markdown"
     max_pages = 300         # headroom above the 50-doc minimum
     main_content_only = True

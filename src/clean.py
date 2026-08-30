@@ -67,6 +67,21 @@ def light_clean(md: str) -> str:
     # Strip emojis to keep the text clean
     md = emoji.replace_emoji(md, replace="")
 
+    # Full paper renders often retain a complete bibliography.  It is nearly
+    # all author/title repetition, weakens retrieval, and has no useful body
+    # context for the debate corpus.
+    md = re.split(r"(?im)^\s{0,3}#{1,6}\s*(?:references|bibliography|works cited)\s*$", md, maxsplit=1)[0]
+    md = re.split(r"(?im)^\s*(?:references|bibliography|works cited)\s*$", md, maxsplit=1)[0]
+
+    # ar5iv / LaTeX remnants and display-equation numbering.
+    md = re.sub(r"\\(?:cite|citet|citep|ref|eqref)\{[^}]*\}", "", md)
+    md = re.sub(r"\\(?:begin|end)\{[^}]*\}", "", md)
+    md = re.sub(r"\\(?:label|tag)\{[^}]*\}", "", md)
+    md = re.sub(r"(?m)^\s*(?:\(?\d+(?:\.\d+)*\)?|\[\d+\])\s*$", "", md)
+
+    # Captions are normally detached from their evidence after conversion.
+    md = re.sub(r"(?im)^\s*(?:\*\*)?(?:figure|fig\.|table)\s*\d+[\.:].*$", "", md)
+
     # Cut arXiv's nav chrome that appears before the actual abstract.
     md = re.sub(
         r".*?(?=> ?Abstract:)", "", md, count=1, flags=re.DOTALL
@@ -83,6 +98,21 @@ def light_clean(md: str) -> str:
     # Strip arXiv footer metadata (e.g., "arXiv:XXXX.XXXXX ...")
     md = re.sub(r"^arXiv:\d+\.\d+.*$", "", md, flags=re.MULTILINE)
 
+    # PyMuPDF exposes page numbers and often splits a sentence at every
+    # visual line. Remove page-number lines, then join ordinary prose lines
+    # while retaining Markdown headers, lists and real paragraph breaks.
+    md = re.sub(r"(?m)^\s*(?:page\s+)?\d+\s*$", "", md)
+    lines = md.splitlines()
+    normalized = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            normalized.append("")
+        elif normalized and normalized[-1] and not re.match(r"^(#{1,6}\s|[-*+]\s|\d+[.)]\s|>)", line) and not re.match(r"^(#{1,6}\s|[-*+]\s|\d+[.)]\s|>)", normalized[-1]) and not normalized[-1].endswith((".", "?", "!", ":", ";")):
+            normalized[-1] += " " + line
+        else:
+            normalized.append(line)
+    md = "\n".join(normalized)
     md = re.sub(r"\n{3,}", "\n\n", md)   # collapse 3+ blank lines to 1
     md = re.sub(r"[ \t]+\n", "\n", md)   # trailing whitespace on lines
     return md.strip()
