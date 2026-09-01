@@ -1,8 +1,8 @@
-scrapling[rag,fetchers]
-PyMuPDF
-langchain-text-splitters
-sentence-transformers
-psycopg2-binary
-python-dotenv
-numpy
-emoji
+scrapling[rag,fetchers]>=0.4,<0.5
+PyMuPDF>=1.26,<2
+langchain-text-splitters>=1,<2
+sentence-transformers>=5,<7
+psycopg2-binary>=2.9,<3
+python-dotenv>=1,<2
+numpy>=1.26,<3
+emoji>=2,<3

@@ -19,7 +19,7 @@ The knowledge base covers six core debate topics in modern LLM architecture:
 Web Sources (arXiv, HuggingFace, Lilian Weng)
         │
         ▼
-[1] Spider (Scrapling SiteToMarkdownSpider)     → data/raw_docs.jsonl
+[1] Query-driven collection (arXiv + blogs)     → data/raw_docs.jsonl
         │
         ▼
 [2] Clean (dedup arXiv versions, relevance)     → data/clean_docs.jsonl
@@ -34,10 +34,10 @@ Web Sources (arXiv, HuggingFace, Lilian Weng)
 [5] Store (PostgreSQL + pgvector + tsvector)    → chunks table
         │
         ▼
-[6] Retrieve (Hybrid: vector + BM25 + reranker) → ranked results
+[6] Retrieve (vector + text rank + reranker)     → ranked results
         │
         ▼
-[7] Evaluate (7 queries, P@5/R@5/MRR)          → data/eval_results.json
+[7] Evaluate (30 source-qrel queries + ablation) → data/eval_results.json
 ```
 
 ---
@@ -74,6 +74,8 @@ qubettera\Scripts\activate
 # source qubettera/bin/activate
 
 pip install -r requirements.txt
+# For development and tests:
+pip install -r requirements-dev.txt
 ```
 
 ### Configure Environment
@@ -93,18 +95,22 @@ cp .env.example .env
 python src/run_pipeline.py
 ```
 
-This runs all steps in sequence: spider → clean → chunk → embed → store.
+This runs all steps in sequence: collect → clean → chunk → embed → atomic store.
 
 ### Skip Scraping (use existing data)
 
 ```bash
-python src/run_pipeline.py --skip-scrape
+python src/run_pipeline.py --skip-collection
 ```
 
 ### Individual Steps
 
 ```bash
-python src/spider.py        # Step 1: Collect documents
+python src/collection.py    # Step 1: Collect documents
+# Fast benchmark-source backfill, preserving the current corpus:
+python src/collection.py --curated-only
+# Broader paginated discovery while preserving existing raw documents:
+python src/collection.py --max-arxiv-per-topic 100
 python src/clean.py         # Step 2: Clean and filter
 python src/chunk.py         # Step 3: Chunk documents
 python src/embed.py         # Step 4: Generate embeddings
@@ -116,7 +122,7 @@ python src/store.py         # Step 5: Store in PostgreSQL
 ```bash
 python src/retrieve.py "What are the advantages of Mixture of Experts?"
 python src/retrieve.py "GRPO vs PPO" --top-k 10
-python src/retrieve.py "sliding window attention" --no-rerank
+python src/retrieve.py "sliding window attention" --rerank
 python src/retrieve.py "Mamba SSM" --json
 ```
 
@@ -124,6 +130,8 @@ python src/retrieve.py "Mamba SSM" --json
 
 ```bash
 python src/evaluate.py
+# Optional strict mode: stop when any judged source is missing:
+python src/evaluate.py --require-complete-corpus
 # or
 python src/run_pipeline.py --eval-only
 ```
@@ -134,11 +142,11 @@ python src/run_pipeline.py --eval-only
 
 ### Data Collection Strategy
 
-**Tool:** Scrapling `SiteToMarkdownSpider` — converts web pages to clean Markdown during crawl, eliminating the need for a separate HTML-to-text step.
+**Tool:** A shared curated seed set plus paginated arXiv discovery, Scrapling fetchers, and Markdown conversion. Citation-neighbor expansion uses Semantic Scholar, while configured blog indexes provide non-paper sources.
 
-**Sources:** 40+ seed URLs from arXiv (paper abstracts), HuggingFace Blog (explainer posts), and Lilian Weng's blog (in-depth survey posts). Links are followed only if they match on-topic URL patterns.
+**Sources:** Curated seeds provide deterministic coverage and topic queries expand the corpus without importing held-out evaluation query text. Existing raw documents are merged by canonical URL, with broken or incomplete records automatically replaced by higher-quality fetches. arXiv collection attempts full ar5iv HTML, then PDF extraction, then an abstract-only fallback. Blog sources are configured in `src/collection.py`.
 
-**Deduplication:** arXiv publishes multiple versions of the same paper (v1, v2, …). The spider's `deny` rules skip versioned URLs, and the cleaner deduplicates any remaining versions by keeping only the versionless/latest.
+**Deduplication:** arXiv URLs are canonicalized to versionless IDs, and the cleaner deduplicates remaining arXiv versions and normalized non-arXiv URLs.
 
 ### Cleaning Strategy
 
@@ -150,14 +158,17 @@ python src/run_pipeline.py --eval-only
 
 **Method:** Structure-aware chunking (Markdown header split → recursive character split).
 
-**Why:** Our documents are arXiv abstracts and blog posts with real heading structure. Splitting on headers first keeps each debate-relevant argument together as one semantic unit (e.g., an entire subsection on "GRPO vs PPO"), rather than slicing mid-argument at a fixed character count.
+**Why:** Full papers and blog posts contain useful heading structure. Splitting on headers first keeps each debate-relevant argument together before bounded recursive splitting.
+
+**Embedding context:** Each chunk keeps its original evidence text for display and adds deterministic `embedding_text` containing the document title, section path, and chunk text. The contextual form is used for vector embedding and reranking.
 
 **Parameters:**
-- Chunk size: 800 characters (~150–200 tokens)
-- Chunk overlap: 100 characters
-- Min chunk length: 40 characters (drops lone headers)
 
-**Trade-off:** Larger chunks (1500 chars) preserve more context but reduce retrieval precision. 800/100 favors precision, which matters more for debate/evidence-citation than summarization.
+- Chunk size: 1200 characters
+- Chunk overlap: 300 characters
+- Min chunk length: 200 characters (drops near-empty fragments)
+
+**Trade-off:** The 1200/300 configuration preserves more local evidence and reduces fragmentation, but long contextual chunks can be truncated by MiniLM's configured input window. Treat further increases as an evaluated tuning change.
 
 ### Embedding Model
 
@@ -179,28 +190,32 @@ Reason for selection:
 - **IVFFlat index** (cosine distance) for approximate nearest-neighbor vector search
 - **GIN index** on a generated `tsvector` column for full-text keyword search
 
-The schema stores: chunk text, embedding vector, source URL, title, section headers (JSONB), document/chunk indices, character length, and embedding model name.
+The schema stores: original chunk text, contextual embedding text, embedding vector, source URL, title, section headers (JSONB), document/chunk indices, character length, and embedding identity.
+
+The index is capped at 100 IVFFlat lists and the current retrieval configuration probes all 100. This favors reproducible, effectively exhaustive search for the 15k-chunk corpus; probe count can be reduced later if scale makes latency more important than exact regression stability.
 
 ### Retrieval Strategy
 
-**Hybrid Search + Cross-Encoder Reranking:**
+**Hybrid Search with Optional Cross-Encoder Reranking:**
 
 1. **Vector search:** Cosine similarity via pgvector finds semantically similar chunks
-2. **Keyword search:** PostgreSQL `tsvector`/`tsquery` full-text search finds exact term matches (BM25-style)
-3. **Reciprocal Rank Fusion (RRF):** Merges both ranked lists — a chunk ranked highly by either method surfaces to the top; a chunk ranked by both gets an even stronger boost. `score = Σ 1/(k + rank)` with k=60.
-4. **Cross-encoder reranking:** The top RRF candidates are re-scored by `cross-encoder/ms-marco-MiniLM-L-6-v2`, which sees query and chunk together for more accurate relevance estimation.
+2. **Text search:** PostgreSQL `tsvector`/`tsquery` with `ts_rank_cd` finds exact/stemmed term matches
+3. **Reciprocal Rank Fusion (RRF):** Merges both ranked lists — a chunk ranked highly by either method surfaces to the top; a chunk ranked by both gets an even stronger boost. `score = Σ 1/(k + rank)` with k=30.
+4. **Optional cross-encoder reranking:** With `--rerank`, the top RRF candidates are re-scored by `cross-encoder/ms-marco-MiniLM-L-6-v2`, which sees the query and contextual chunk text together.
 
 **Why hybrid:** Vector search catches conceptual similarity ("models that route tokens to experts" → MoE), while keyword search catches exact terms ("GRPO", "Mamba") that embeddings can miss for rare domain acronyms.
 
-**Why reranker:** The cross-encoder sees query+chunk jointly rather than independently, detecting fine-grained relevance at ~100ms extra latency for 20 candidates.
+**Why reranking is opt-in:** The cross-encoder sees the query, document title, section path, and chunk jointly. On the current 30-query evaluation, it reduces Hit@5 from `0.6000` to `0.4667`, so hybrid-only retrieval is the default until a better reranker or training strategy is validated.
 
 ### Evaluation Methodology
 
-- **7 test queries** covering all 6 debate topics
-- **Expected relevant sources** defined per query (arXiv paper IDs and blog URLs)
-- **Metrics:** Precision@5, Recall@5, Mean Reciprocal Rank (MRR)
-- **Comparison:** Hybrid+reranker vs. hybrid-only to quantify reranker value
-- Automated interpretation/recommendation based on metric differences
+- **30 test queries** covering all 6 debate topics
+- **Fixed exact-source qrels**; title/text hints never create relevance
+- **Coverage reporting:** incomplete corpora produce clearly marked diagnostic results by default; `--require-complete-corpus` enables the strict coverage gate
+- **Metrics:** Hit@5, Precision@5, source Recall@5, MRR, and fixed-qrel nDCG@5
+- **Paired comparison:** hybrid retrieval and hybrid+reranker, including per-query ranked evidence and latency
+- **Run manifest:** qrels version, timestamp, git revision, corpus/model versions, scores, and relevance decisions
+- **Current corpus coverage:** 24/24 judged sources and 30/30 fully covered queries
 
 ---
 
@@ -218,6 +233,7 @@ Output:
       - title (str): document title
       - headers (dict): section headers
       - similarity (float): cosine similarity
+      - text_rank_score (float | null): PostgreSQL full-text relevance
       - rrf_score (float): RRF fusion score
       - rerank_score (float): cross-encoder score (if reranked)
 
@@ -232,7 +248,8 @@ Example:
     "Switch Transformers use a simplified MoE routing strategy..."
     >>> results[0]["url"]
     "https://arxiv.org/abs/2101.03961"
-    >>> results[0]["rerank_score"]
+    >>> reranked = retrieve("What is Mixture of Experts?", top_k=5, rerank=True)
+    >>> reranked[0]["rerank_score"]
     8.234
 ```
 
@@ -240,11 +257,25 @@ Example:
 
 ## Known Limitations
 
-1. **arXiv abstracts only:** The spider collects abstract pages, not full paper PDFs. This limits the depth of information available for each paper.
-2. **Embedding model size:** all-MiniLM-L6-v2 is a small model. Domain-specific or larger models would likely improve retrieval quality.
-3. **Keyword search sensitivity:** PostgreSQL's `plainto_tsquery` uses English stemming, which may not handle ML-specific terms ideally (e.g., "pre-training" vs "pretraining").
-4. **Static knowledge base:** The pipeline is batch-oriented. New papers require re-running the spider.
-5. **Evaluation scope:** 7 queries give directional signal but not statistical significance. Production evaluation would need 50+ queries.
+1. **Fallback quality:** ar5iv is preferred, but PDF and abstract-only fallbacks have less reliable structure.
+2. **Embedding model size:** all-MiniLM-L6-v2 is small; a domain-specific or larger model may improve retrieval quality.
+3. **Text-search sensitivity:** `plainto_tsquery` and English stemming do not handle every ML acronym or spelling variant equally.
+4. **Batch updates:** new sources require rerunning collection and downstream stages.
+5. **Evaluation scope:** 30 queries are useful for regression checks but remain too small for broad statistical claims.
+6. **Static blog discovery:** some JavaScript-heavy sites can expose incomplete article indexes without a browser-rendered collector.
+7. **Context-window truncation:** some 1200-character contextual chunks exceed MiniLM's configured 256-token window; a token-aware chunking experiment is the next quality-tuning step.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests -q -p no:cacheprovider
+python -m compileall -q src tests
+```
+
+The suite covers collection fallbacks and quality-aware merging, contextual chunk identity, resumable embedding metadata, artifact validation, exact-source evaluation metrics, retrieval guards, and direct script execution.
 
 ---
 
@@ -255,10 +286,11 @@ Example:
 ├── README.md               # This file
 ├── .env.example            # Environment variable template
 ├── .gitignore              # Git ignore rules
-├── requirements.txt        # Python dependencies
+├── requirements.txt        # Runtime dependencies
+├── requirements-dev.txt    # Runtime + test dependencies
 │
 ├── data/                   # Generated data (not in git)
-│   ├── raw_docs.jsonl      # Spider output
+│   ├── raw_docs.jsonl      # Collection output
 │   ├── clean_docs.jsonl    # Cleaned + filtered
 │   ├── chunks.jsonl        # Chunked documents
 │   ├── chunks_with_embeddings.jsonl
@@ -269,7 +301,11 @@ Example:
 │   └── design_decisions.md # Detailed design rationale
 │
 └── src/
-    ├── spider.py           # Step 1: Data collection
+    ├── collection.py       # Step 1: query-driven data collection
+    ├── database.py         # Shared PostgreSQL configuration
+    ├── jsonl.py            # Strict atomic JSONL helpers
+    ├── source_seeds.py     # Shared deterministic source seeds
+    ├── spider.py           # Legacy/static collection helper
     ├── clean.py            # Step 2: Cleaning + filtering
     ├── chunk.py            # Step 3: Chunking
     ├── embed.py            # Step 4: Embedding generation
@@ -303,9 +339,10 @@ cp .env.example .env
 # 4. Run the full pipeline
 python src/run_pipeline.py
 
-# 5. Run retrieval
-python src/retrieve.py "What are the advantages of MoE?"
+# 5. Verify and evaluate
+python -m pytest tests -q -p no:cacheprovider
+python src/evaluate.py --require-complete-corpus
 
-# 6. Run evaluation
-python src/evaluate.py
+# 6. Run retrieval
+python src/retrieve.py "What are the advantages of MoE?"
 ```

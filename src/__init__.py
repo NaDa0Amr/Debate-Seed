@@ -1,1 +1,1 @@
-# RAG Knowledge Pipeline — src package
+"""RAG knowledge pipeline package."""

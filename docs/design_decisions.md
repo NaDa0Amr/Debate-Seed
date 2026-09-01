@@ -1,205 +1,118 @@
-# Design Decisions
+# Design decisions
 
-This document explains the rationale behind each major architectural and technical decision in the RAG knowledge pipeline.
+## 1. Collection
 
----
+The primary entry point is `src.collection`, not the legacy static spider. The spider's corrected curated seeds are shared through `src.source_seeds`, while ten topic-level arXiv queries and citation expansion broaden the six debate areas. The benchmark sources are part of the frozen corpus foundation; held-out evaluation query text is not used for discovery or ranking.
 
-## 1. Data Collection
+Each arXiv candidate is canonicalized to a versionless `/abs/<id>` URL and fetched in this order:
 
-### Source Selection
+1. Full ar5iv HTML converted to Markdown
+2. PDF text extracted with PyMuPDF
+3. Abstract-only fallback
 
-**Decision:** Seed the spider with 40+ specific URLs from arXiv, HuggingFace Blog, and Lilian Weng's blog.
+ArXiv API results are paginated when the per-topic limit exceeds the page size. One citation/reference hop through Semantic Scholar improves coverage of foundational papers. Existing raw documents are preserved by default and new documents are merged by canonical URL. Blog sources and their path rules live in `BLOG_SOURCE_CONFIG`; collection reports preserved, attempted, and newly written counts plus per-domain fetch methods to `data/collection_report.json`.
 
-**Why:** Rather than broad crawling (e.g., "crawl all of arxiv.org"), we use targeted seeding because:
-- It ensures high-quality, on-topic content from the start
-- It avoids the noise of general-purpose crawling (e.g., arXiv listing pages, random CS papers)
-- The allowed `follow` patterns let the crawler discover related papers linked from our seeds
-- Lilian Weng's posts are dense survey-style articles that reference many papers, making them excellent starting points for link discovery
+Trade-offs:
 
-**Trade-off:** We sacrifice breadth (some relevant papers won't be discovered) for precision (nearly everything collected is on-topic).
+- Full papers improve evidence depth but produce far more chunks than abstracts.
+- PDF fallback is robust but loses heading structure.
+- Static blog indexes are reproducible and inexpensive, but JavaScript-heavy sites can remain incomplete.
 
-### arXiv Version Deduplication
+## 2. Cleaning and filtering
 
-**Decision:** The spider's `deny` rules skip versioned arXiv URLs (`/abs/1706.03762v1`, `v2`, etc.).
+The cleaner removes common navigation, footer, bibliography, LaTeX, caption, page-number, and whitespace noise. It deduplicates arXiv versions and normalized URLs before relevance filtering.
 
-**Why:** arXiv publishes each revision as a separate URL. Without deduplication, a single paper with 7 versions becomes 7 near-identical documents, inflating chunk counts and degrading retrieval precision (the same content appears in multiple chunks). The versionless URL (`/abs/1706.03762`) always serves the latest revision.
+Relevance terms are normalized to lowercase alphanumeric tokens, so punctuation variants such as `Mixture-of-Experts` match `mixture of experts`. A title with one strong topic phrase is sufficient; body-only content needs at least two strong topic signals in the title plus first 12,000 characters. This reduces false positives caused by citations deep in full papers.
 
-### Scraping Tool
+This filter is a collection safety net, not an evaluation label. Retrieval relevance is determined only by versioned qrels.
 
-**Decision:** Scrapling `SiteToMarkdownSpider`.
+## 3. Chunking
 
-**Why:** Scrapling's `SiteToMarkdownSpider` template converts pages to clean Markdown during the crawl itself, handling HTML parsing, script/style removal, and structural conversion in one step. This eliminates the need for a separate HTML-to-Markdown tool and ensures consistent conversion quality.
-
----
-
-## 2. Data Cleaning
-
-### Relevance Filtering
-
-**Decision:** Two-tier keyword filtering with "strong" and "weak" keyword lists.
-
-**Why:** A simple keyword count (`text.count("attention") >= 1`) produces too many false positives — "attention" appears in papers about computer vision, psychology, and many unrelated fields. By requiring at least 1 strong keyword (e.g., "mixture of experts", "mamba", "grpo") AND ≥2 total keyword hits, we ensure documents are genuinely about our debate topics.
-
-**Trade-off:** Some borderline papers may be dropped. We log dropped documents with reasons to `data/dropped_docs.jsonl` for manual inspection.
-
-### arXiv Boilerplate Removal
-
-**Decision:** Regex-based removal of arXiv navigation chrome, submission history, and download links.
-
-**Why:** Even after Markdown conversion, arXiv pages contain structured boilerplate (submission dates, version history tables, navigation links) that adds noise to chunks without contributing information. Since this boilerplate follows predictable patterns across all arXiv pages, regex is reliable here.
-
----
-
-## 3. Chunking Strategy
-
-### Method: Structure-Aware (Markdown Header Split → Recursive Character Split)
-
-**Decision:** First split on Markdown headers (#, ##, ###), then recursively split oversized sections.
-
-**Why:** Our documents have real structural headings (paper sections, blog post headers). Splitting on headers preserves semantic coherence — an entire "MoE vs Dense" subsection stays together as one chunk when it fits, rather than being cut mid-argument at an arbitrary character boundary.
-
-**Alternative considered:** Fixed-size chunking (simpler but loses structural context). Semantic chunking (embedding-based boundary detection — interesting but overkill for documents with explicit headers).
-
-### Parameters
+Chunking first splits Markdown on `#`, `##`, and `###` headings and then recursively splits long sections.
 
 | Parameter | Value | Rationale |
-|-----------|-------|-----------|
-| Chunk size | 800 chars | ~150-200 tokens, well within all-MiniLM-L6-v2's 256-token input limit. Favors retrieval precision over context preservation. |
-| Chunk overlap | 100 chars | Ensures context isn't lost at cut boundaries. A sentence split across two chunks will appear in both. |
-| Min chunk length | 40 chars | Drops fragments that are just a header with no body text. |
+|---|---:|---|
+| Chunk size | 1200 characters | Preserves more local evidence while keeping retrieval units bounded |
+| Overlap | 300 characters | Preserves context at boundaries |
+| Minimum length | 200 characters | Removes near-empty fragments and boilerplate slices |
 
----
+Chunks carry URL/title provenance, heading metadata, document/chunk indexes, collection timestamp, pipeline version, and preprocessing version. Original text remains the cited evidence, while `embedding_text` prefixes the document title and section path for embedding and reranking. The source URL plus contextual text form the SHA-256 cache identity, so provenance changes force vector regeneration and identical passages from distinct sources remain independently retrievable.
 
-## 4. Embedding Model
+## 4. Embeddings and cache identity
 
-### Model: `all-MiniLM-L6-v2`
+The default model is `all-MiniLM-L6-v2` with 384 dimensions. Model name, requested revision, dimensionality, pipeline version, and preprocessing version are configured centrally in `src.settings`.
 
-| Property | Value |
-|----------|-------|
-| Dimensions | 384 |
-| Model size | ~80 MB |
-| Max tokens | 256 |
-| License | Apache 2.0 |
+The embedding artifact is resumable, but a cache row is reusable only when all of these agree:
 
-**Why:**
-- **Free and local:** No API key, no cost per embedding, no rate limits. Important for a reproducible project.
-- **Fast on CPU:** Embeds ~4800 chunks in under 30 seconds without a GPU.
-- **Proven quality:** Widely used baseline in retrieval benchmarks (MTEB). While not SOTA, it's "good enough" for ~200 documents.
+- Content hash
+- Embedding model
+- Embedding model revision
+- Embedding dimension
+- Preprocessing version
+- Pipeline version
 
-**Trade-offs documented:**
-- `all-mpnet-base-v2` (768-dim): ~2x better retrieval quality on MTEB, but 3x larger and slower.
-- OpenAI `text-embedding-3-small` (1536-dim): Higher quality, but introduces API cost and external dependency.
-- Domain-specific models: Could improve on ML-specific terminology, but none are readily available for this narrow domain.
+Changing a model or preprocessing version therefore forces the affected vectors to be regenerated. Every output vector is converted to plain Python floats and dimension-checked before it is written.
 
----
+## 5. PostgreSQL and pgvector
 
-## 5. Database Configuration
+The `chunks` table stores chunk provenance, complete embedding identity, a pgvector column, and a generated English `tsvector`.
 
-### PostgreSQL + pgvector
+Publishing is atomic:
 
-**Decision:** Use PostgreSQL with the pgvector extension for vector storage, and PostgreSQL's built-in full-text search for keyword matching.
+1. Validate the chunk/embedding manifests and their identity.
+2. Stream embeddings into `chunks_staging` in bounded batches.
+3. Build IVFFlat and GIN indexes and run `ANALYZE`.
+4. Verify row counts and that model identities are uniform.
+5. Swap the staging table into the live `chunks` name in the same transaction.
 
-**Why:** PostgreSQL is required by the project. pgvector adds native vector operations. Using the same database for both vector and keyword search avoids the complexity of managing a separate search engine (e.g., Elasticsearch).
+Any error rolls back the transaction, preserving the previous working `chunks` table.
 
-### Schema Design
+## 6. Retrieval
 
-The `chunks` table stores everything needed for retrieval and provenance:
+Retrieval has four stages:
 
-```sql
-CREATE TABLE chunks (
-    chunk_id        TEXT PRIMARY KEY,
-    text            TEXT NOT NULL,
-    url             TEXT,
-    title           TEXT,
-    headers         JSONB,
-    doc_index       INTEGER,
-    chunk_index     INTEGER,
-    char_len        INTEGER,
-    embedding_model TEXT,
-    embedding       VECTOR(384),
-    text_search     TSVECTOR GENERATED ALWAYS AS (
-        to_tsvector('english', coalesce(title, '') || ' ' || text)
-    ) STORED
-);
-```
+1. Cosine vector search through pgvector
+2. PostgreSQL full-text matching scored with `ts_rank_cd`
+3. Reciprocal Rank Fusion (RRF) over both ranked lists
+4. Opt-in `cross-encoder/ms-marco-MiniLM-L-6-v2` reranking
 
-Key decisions:
-- **`text_search` as a generated column:** Automatically maintained by PostgreSQL on insert/update. No application code needed to keep it in sync.
-- **`headers` as JSONB:** Preserves the section hierarchy from the Markdown header split, which is useful for displaying context in retrieval results.
-- **IVFFlat index:** Approximate nearest-neighbor index for fast vector search. Lists count = sqrt(n) following the pgvector recommendation.
-- **GIN index:** Standard index type for full-text search on tsvector columns.
+`ts_rank_cd` is intentionally called a text-rank score, not BM25. RRF avoids attempting to calibrate cosine and text-rank scores onto one scale. Storage caps IVFFlat at 100 lists and retrieval currently probes all 100, making candidate search stable across index rebuilds at this corpus scale.
 
----
+Before searching, retrieval verifies that the table contains exactly the configured embedding model, revision, preprocessing version, and pipeline version. This prevents query vectors from being compared with incompatible stored vectors.
 
-## 6. Retrieval Strategy
+Vector embedding and cross-encoder reranking use deterministic contextual text containing the document title, section path, and original chunk. Returned evidence remains the original chunk text. With the current 1200-character chunks, MiniLM can truncate some contextual inputs, so chunk size remains an evaluation-controlled trade-off.
 
-### Hybrid Search (Vector + BM25) + Cross-Encoder Reranking
+Candidate selection allows at most two chunks per normalized source before reranking, and final output allows one. Normalization collapses arXiv versions and trailing slashes. This avoids one long paper consuming the entire top-k and makes source-level evaluation well defined.
 
-This is a three-stage retrieval pipeline:
+Hybrid-only retrieval is the runtime default because the completed 30-query evaluation currently scores higher than the reranked mode (Hit@5 `0.6000` versus `0.4667`). Reranking remains available explicitly for experiments and is always measured during evaluation.
 
-```
-Query
-  │
-  ├─→ Vector Search (pgvector cosine) ──→ Top 30 by similarity
-  │                                           │
-  ├─→ Keyword Search (tsvector/tsquery) ─→ Top 30 by BM25 rank
-  │                                           │
-  └─→ Reciprocal Rank Fusion (RRF) ─────→ Merged top ~40 candidates
-                                              │
-                                              ▼
-                                    Cross-Encoder Reranker
-                                    (ms-marco-MiniLM-L-6-v2)
-                                              │
-                                              ▼
-                                    Final Top-K results
-```
+## 7. Evaluation
 
-### Why Hybrid Over Pure Vector
+The 30-query evaluation uses explicit exact-source qrels (`source-qrels-v2`). Text or title hints never create relevance.
 
-Vector search alone misses:
-- **Exact term matches:** The query "GRPO" should retrieve chunks containing that exact acronym, but a 384-dim embedding may not represent rare domain acronyms precisely.
-- **Keyword-heavy queries:** "PPO vs GRPO reinforcement learning" has clear keyword signals that BM25 captures perfectly.
+Before retrieval, a corpus audit reports:
 
-Keyword search alone misses:
-- **Semantic similarity:** "Models that route tokens to a subset of experts" should retrieve MoE content even though it doesn't mention "MoE" or "Mixture of Experts."
+- Unique judged sources present and missing
+- Per-query available/missing sources
+- Fully covered query count
+- Maximum attainable source-recall ceiling
 
-### Reciprocal Rank Fusion (RRF)
+Strict evaluation stops if any judged source is missing. `--allow-incomplete-corpus` is reserved for a clearly marked end-to-end diagnostic; it does not turn missing sources into retrieval failures silently.
 
-**Formula:** `score(d) = Σ 1/(k + rank_i(d))` across all retriever lists, with k=60.
+Metrics are computed at source level:
 
-**Why RRF:**
-- No learned parameters — works out of the box
-- Score-agnostic — doesn't need calibrated similarity/BM25 scores
-- Symmetric — treats both retrievers equally unless their rank distributions differ naturally
+| Metric | Meaning |
+|---|---|
+| Hit@k | At least one judged source appears in the top k |
+| Precision@k | Unique judged sources in the top k divided by k |
+| Source recall@k | Fraction of fixed judged sources retrieved |
+| MRR | Reciprocal rank of the first judged source |
+| nDCG@k | Ranking gain normalized against the fixed qrels |
 
-### Cross-Encoder Reranking
+A duplicate source can count only once. IDCG is based on the number of fixed relevant sources, never on observed system hits.
 
-**Model:** `cross-encoder/ms-marco-MiniLM-L-6-v2`
+Every run evaluates hybrid-only and hybrid-plus-reranker modes. The output records ranked chunks, scores, relevance decisions, per-query latency, corpus/model versions, qrels version, timestamp, git revision, aggregate results over all queries, and a separate aggregate over fully covered queries.
 
-**Why:** A bi-encoder (used for initial retrieval) embeds query and document independently, so it can't model fine-grained interactions between them. A cross-encoder processes (query, document) as a single input, allowing it to detect whether a specific question is actually answered by a specific passage.
+## 8. Reproducibility policy
 
-**Trade-off:** Adds ~100ms of latency for 20 candidates. Acceptable for this use case (not real-time search). Can be disabled with `--no-rerank` if latency matters.
-
----
-
-## 7. Evaluation Methodology
-
-### Test Queries
-
-7 queries covering all 6 debate topics, plus one cross-cutting (SSM/Mamba). Each query has a set of expected relevant source URLs (arXiv paper IDs and blog URLs).
-
-### Metrics
-
-| Metric | What it measures | Why we use it |
-|--------|-----------------|---------------|
-| Precision@5 | Fraction of top-5 that are relevant | "How noisy are the results?" |
-| Recall@5 | Fraction of expected sources found in top-5 | "How much relevant content are we finding?" |
-| MRR | 1/rank of the first relevant result | "How quickly does the user see something relevant?" |
-
-### Comparison Modes
-
-We evaluate in two modes to quantify the value of each pipeline stage:
-1. **Hybrid + Reranker** — full pipeline
-2. **Hybrid Only** — no cross-encoder reranking
-
-This lets us make a data-driven recommendation about whether the reranker justifies its latency cost.
+Generated artifacts are versioned by their embedded metadata, not just filenames. A valid comparison requires the same qrels version, corpus/pipeline version, embedding model/revision, preprocessing version, candidate-pool settings, `k`, and reranker model/revision. Any difference belongs in the evaluation run manifest.
